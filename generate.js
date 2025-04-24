@@ -4,6 +4,7 @@
 // Untuk menjalankan kode ini, install package berikut:
 // npm install @solana/web3.js @solana/spl-token bip39 ed25519-hd-key bs58 prompt-sync
 const { Keypair, Connection, PublicKey, Transaction, SystemProgram, sendAndConfirmTransaction, LAMPORTS_PER_SOL } = require('@solana/web3.js');
+const { Token, TOKEN_PROGRAM_ID, AccountLayout } = require('@solana/spl-token');
 const bip39 = require('bip39');
 const { derivePath } = require('ed25519-hd-key');
 const bs58 = require('bs58');
@@ -390,6 +391,232 @@ async function sendMaxBalanceFromMultipleWallets(mnemonicPhrase, sourceWalletInd
   return { success: successCount, fail: failCount };
 }
 
+// Fungsi untuk mendapatkan token accounts dari wallet
+async function getTokenAccounts(connection, publicKey) {
+  try {
+    // Dapatkan semua token accounts yang dimiliki oleh wallet
+    const tokenResp = await connection.getParsedTokenAccountsByOwner(
+      new PublicKey(publicKey),
+      { programId: TOKEN_PROGRAM_ID }
+    );
+    
+    // Format data token untuk mudah dibaca
+    const tokenAccounts = tokenResp.value.map(accountInfo => {
+      const parsedInfo = accountInfo.account.data.parsed.info;
+      const mintAddress = parsedInfo.mint;
+      const tokenBalance = parsedInfo.tokenAmount.uiAmount;
+      const decimals = parsedInfo.tokenAmount.decimals;
+      
+      return {
+        pubkey: accountInfo.pubkey.toString(),
+        mint: mintAddress,
+        owner: parsedInfo.owner,
+        balance: tokenBalance,
+        decimals: decimals,
+        tokenAccount: accountInfo.pubkey.toString()
+      };
+    });
+    
+    return tokenAccounts;
+  } catch (error) {
+    console.error(`Error getting token accounts: ${error}`);
+    return [];
+  }
+}
+
+// Fungsi untuk mendapatkan metadata token
+async function getTokenMetadata(connection, mintAddress) {
+  try {
+    // Implementasi sederhana, di produksi sebaiknya menggunakan Metaplex untuk metadata lengkap
+    return {
+      address: mintAddress,
+      symbol: "TOKEN", // Default jika tidak bisa mendapatkan simbol sebenarnya
+      name: "Unknown Token",
+      decimals: 9, // Default decimals
+    };
+  } catch (error) {
+    console.error(`Error getting token metadata: ${error}`);
+    return {
+      address: mintAddress,
+      symbol: "TOKEN",
+      name: "Unknown Token",
+      decimals: 9,
+    };
+  }
+}
+
+// Fungsi untuk mengirim semua token dari wallet
+async function sendAllTokens(connection, fromKeypair, destinationAddress, mintAddress, tokenAccount) {
+  try {
+    const mintPublicKey = new PublicKey(mintAddress);
+    const sourceTokenAccount = new PublicKey(tokenAccount);
+    const destinationPublicKey = new PublicKey(destinationAddress);
+    
+    // Dapatkan atau buat token account di wallet tujuan
+    let destinationTokenAccount;
+    try {
+      const receiverTokenAccounts = await connection.getParsedTokenAccountsByOwner(
+        destinationPublicKey,
+        { mint: mintPublicKey }
+      );
+      
+      // Jika penerima sudah memiliki token account untuk token ini
+      if (receiverTokenAccounts.value.length > 0) {
+        destinationTokenAccount = receiverTokenAccounts.value[0].pubkey;
+      } else {
+        // Jika belum, kita perlu membuat token account baru untuk penerima
+        // Namun untuk sederhananya, kita asumsikan token account sudah ada
+        console.log(`Penerima belum memiliki token account untuk token ini.`);
+        console.log(`Token account perlu dibuat terlebih dahulu.`);
+        return null;
+      }
+    } catch (error) {
+      console.error(`Error checking receiver token accounts: ${error}`);
+      return null;
+    }
+    
+    // Dapatkan info token account sumber
+    const sourceAccountInfo = await connection.getParsedAccountInfo(sourceTokenAccount);
+    if (!sourceAccountInfo.value) {
+      console.log(`Token account sumber tidak ditemukan.`);
+      return null;
+    }
+    
+    const parsedSourceData = sourceAccountInfo.value.data.parsed.info;
+    const tokenAmount = parsedSourceData.tokenAmount.amount;
+    
+    if (tokenAmount === '0') {
+      console.log(`Saldo token adalah 0, tidak ada yang dikirim.`);
+      return null;
+    }
+    
+    // Buat dan kirim transaksi
+    const transaction = new Transaction().add(
+      Token.createTransferInstruction(
+        TOKEN_PROGRAM_ID,
+        sourceTokenAccount,
+        destinationTokenAccount,
+        fromKeypair.publicKey,
+        [],
+        parseInt(tokenAmount)
+      )
+    );
+    
+    // Siapkan transaksi
+    const blockHash = await connection.getLatestBlockhash();
+    transaction.recentBlockhash = blockHash.blockhash;
+    transaction.feePayer = fromKeypair.publicKey;
+    
+    // Tanda tangani dan kirim
+    transaction.sign(fromKeypair);
+    
+    const signature = await connection.sendTransaction(transaction, [fromKeypair], {
+      skipPreflight: false,
+      preflightCommitment: 'confirmed',
+    });
+    
+    // Konfirmasi transaksi
+    await connection.confirmTransaction({
+      signature,
+      blockhash: blockHash.blockhash,
+      lastValidBlockHeight: blockHash.lastValidBlockHeight
+    }, 'confirmed');
+    
+    console.log(`Transfer token sukses!`);
+    console.log(`- Dari: ${fromKeypair.publicKey.toString()}`);
+    console.log(`- Ke: ${destinationAddress}`);
+    console.log(`- Token: ${mintAddress}`);
+    console.log(`- Jumlah: ${parsedSourceData.tokenAmount.uiAmount}`);
+    console.log(`- Signature: ${signature}`);
+    console.log(`- Explorer: https://explorer.solana.com/tx/${signature}`);
+    
+    return signature;
+  } catch (error) {
+    console.error(`Error sending tokens: ${error}`);
+    if (error.logs) {
+      console.log("Logs dari error:", error.logs);
+    }
+    return null;
+  }
+}
+
+// Fungsi untuk mengirim semua token dari banyak wallet
+async function sendAllTokensFromMultipleWallets(mnemonicPhrase, sourceWalletIndices, destinationAddress, mintAddress) {
+  const connection = new Connection('https://warmhearted-flashy-log.solana-mainnet.quiknode.pro/f3bd07d7ed5eb162efdcf0aab4ae21bd1847a156/', 'confirmed');
+  let successCount = 0;
+  let failCount = 0;
+  
+  // Sortir dan hapus duplikat pada indeks wallet
+  sourceWalletIndices = [...new Set(sourceWalletIndices)].sort((a, b) => a - b);
+  
+  if (sourceWalletIndices.length === 0) {
+    console.log("Tidak ada wallet yang dipilih untuk transfer.");
+    return { success: 0, fail: 0 };
+  }
+
+  const mintPublicKey = new PublicKey(mintAddress);
+  const tokenMetadata = await getTokenMetadata(connection, mintAddress);
+  
+  console.log(`\nMemulai transfer batch semua token ${tokenMetadata.symbol} dari ${sourceWalletIndices.length} wallet ke ${destinationAddress}`);
+  console.log("=".repeat(50));
+
+  for (let i = 0; i < sourceWalletIndices.length; i++) {
+    const walletIndex = sourceWalletIndices[i];
+    const path = `m/44'/501'/${walletIndex}'/0'`;
+    const keypair = getKeypairFromMnemonic(mnemonicPhrase, path);
+
+    console.log(`\nProses wallet #${walletIndex + 1} (${keypair.publicKey.toString()})`);
+    
+    // Dapatkan semua token accounts
+    const tokenAccounts = await getTokenAccounts(connection, keypair.publicKey.toString());
+    
+    // Filter token accounts untuk token yang diminta
+    const relevantTokenAccounts = tokenAccounts.filter(acc => acc.mint === mintAddress);
+    
+    if (relevantTokenAccounts.length === 0) {
+      console.log(`Wallet ini tidak memiliki token ${mintAddress}. Melewati wallet ini.`);
+      failCount++;
+      continue;
+    }
+    
+    for (const tokenAcc of relevantTokenAccounts) {
+      console.log(`Token account: ${tokenAcc.tokenAccount}`);
+      console.log(`Saldo: ${tokenAcc.balance} ${tokenMetadata.symbol}`);
+      
+      if (tokenAcc.balance <= 0) {
+        console.log(`Saldo token adalah 0. Melewati token account ini.`);
+        continue;
+      }
+      
+      try {
+        const signature = await sendAllTokens(
+          connection,
+          keypair,
+          destinationAddress,
+          mintAddress,
+          tokenAcc.tokenAccount
+        );
+        
+        if (signature) {
+          successCount++;
+        } else {
+          failCount++;
+        }
+      } catch (error) {
+        console.error(`Error saat transfer token: ${error.message}`);
+        failCount++;
+      }
+    }
+  }
+
+  console.log("\n=".repeat(50));
+  console.log(`Hasil batch transfer token:`);
+  console.log(`- Sukses: ${successCount} wallet`);
+  console.log(`- Gagal: ${failCount} wallet`);
+
+  return { success: successCount, fail: failCount };
+}
+
 // Fungsi untuk menampilkan menu
 function displayMenu() {
   console.log("\n===== SOLANA MULTI-WALLET GENERATOR & MANAGER =====");
@@ -400,10 +627,11 @@ function displayMenu() {
   console.log("5. Simpan seed phrase");
   console.log("6. Kirim dari banyak wallet ke 1 wallet");
   console.log("7. Kirim seluruh saldo dari banyak wallet ke 1 wallet");
-  console.log("8. Keluar");
+  console.log("8. Kirim semua token dari banyak wallet ke 1 wallet");
+  console.log("9. Keluar");
   console.log("=".repeat(50));
 
-  const choice = prompt("Pilih menu (1-8): ");
+  const choice = prompt("Pilih menu (1-9): ");
   return choice;
 }
 
@@ -525,25 +753,11 @@ async function main() {
           break;
         }
 
-        console.log("\n===== PILIH WALLET =====");
-        walletData.wallets.forEach((wallet, i) => {
-          console.log(`${i+1}. ${wallet.publicKey}`);
-        });
-
-        const walletIndex = parseInt(prompt("Pilih nomor wallet: ")) - 1;
-
-        if (isNaN(walletIndex) || walletIndex < 0 || walletIndex >= walletData.wallets.length) {
-          console.log("Nomor wallet tidak valid!");
-          break;
+        console.log("\n===== CEK SALDO WALLET =====");
+        for (const wallet of walletData.wallets) {
+          const balance = await getWalletBalance(wallet.publicKey);
+          console.log(`Wallet #${wallet.index + 1}: ${wallet.publicKey} - ${balance} SOL`);
         }
-
-        const publicKey = walletData.wallets[walletIndex].publicKey;
-        const balance = await getWalletBalance(publicKey);
-
-        console.log(`\nSaldo wallet #${walletIndex+1}:`);
-        console.log(`Alamat: ${publicKey}`);
-        console.log(`Saldo: ${balance} SOL`);
-
         break;
 
       case "5":
@@ -581,29 +795,28 @@ async function main() {
         console.log("1. Salah satu wallet sendiri");
         console.log("2. Alamat eksternal");
 
-        const receiverOption6 = prompt("Pilih (1-2): ");
-        let destinationAddress6;
+        const receiverOption = prompt("Masukkan pilihan (1/2): ");
+        let destinationAddress;
 
-        if (receiverOption6 === "1") {
-          // Tampilkan daftar wallet
-          console.log("\nDaftar wallet Anda:");
+        if (receiverOption === "1") {
+          // Pilih dari wallet sendiri
+          console.log("\n===== DAFTAR WALLET =====");
           walletData.wallets.forEach((wallet, i) => {
             console.log(`${i+1}. ${wallet.publicKey}`);
           });
 
           const receiverIndex = parseInt(prompt("Pilih nomor wallet penerima: ")) - 1;
-
-          if (isNaN(receiverIndex) || receiverIndex < 0 || receiverIndex >= walletData.wallets.length) {
-            console.log("Nomor wallet tidak valid!");
+          if (isNaN(receiverIndex)) {
+            console.log("Input tidak valid!");
             break;
           }
 
-          destinationAddress6 = walletData.wallets[receiverIndex].publicKey;
-        } else if (receiverOption6 === "2") {
-          destinationAddress6 = prompt("Masukkan alamat penerima: ");
+          destinationAddress = walletData.wallets[receiverIndex].publicKey;
+        } else if (receiverOption === "2") {
+          // Input alamat eksternal
+          destinationAddress = prompt("Masukkan alamat penerima: ");
           try {
-            // Validasi alamat publik
-            new PublicKey(destinationAddress6);
+            new PublicKey(destinationAddress); // Validasi alamat
           } catch (error) {
             console.log("Alamat Solana tidak valid!");
             break;
@@ -613,86 +826,53 @@ async function main() {
           break;
         }
 
-        // 2. Pilih wallet pengirim (multiple)
+        // 2. Pilih wallet pengirim
         console.log("\n===== PILIH WALLET PENGIRIM =====");
-        console.log("Daftar wallet Anda:");
+        console.log("Format input:");
+        console.log("- Untuk memilih beberapa wallet: 1,3,5");
+        console.log("- Untuk memilih range wallet: 1-10");
+        console.log("- Bisa dikombinasikan: 1,3,5-10,15");
+        console.log("\nDaftar wallet tersedia:");
+        walletData.wallets.forEach((wallet, i) => {
+          console.log(`${i+1}. ${wallet.publicKey}`);
+        });
 
-        // Tampilkan daftar wallet dengan saldo
-        const walletBalances = [];
-        console.log("Mengambil info saldo untuk semua wallet...");
+        const walletSelection = prompt(`Masukkan nomor wallet pengirim (1-${walletData.wallets.length}): `);
+        const selectedIndices = processWalletSelection(walletSelection, walletData.wallets.length);
 
-        for (let i = 0; i < walletData.wallets.length; i++) {
-          const wallet = walletData.wallets[i];
-          const balance = await getWalletBalance(wallet.publicKey);
-          walletBalances.push({ index: i, balance });
-          console.log(`${i+1}. ${wallet.publicKey} - ${balance} SOL`);
-        }
-
-        // Pilih cara memilih wallet
-        console.log("\nCara memilih wallet pengirim:");
-        console.log("1. Pilih semua wallet yang memiliki saldo");
-        console.log("2. Pilih wallet dengan range tertentu (misal: 1-10)");
-        console.log("3. Pilih wallet secara manual (misal: 1,3,5,7)");
-        
-        const selectionMethod6 = prompt("Pilih (1-3): ");
-        let selectedIndices6 = [];
-        
-        if (selectionMethod6 === "1") {
-          // Pilih semua wallet yang memiliki saldo
-          selectedIndices6 = walletBalances
-            .filter(item => item.balance > 0)
-            .map(item => item.index);
-            
-          console.log(`${selectedIndices6.length} wallet dengan saldo dipilih.`);
-        } 
-        else if (selectionMethod6 === "2") {
-          // Pilih wallet dengan range
-          const range = prompt("Masukkan range (misal: 1-10): ");
-          selectedIndices6 = processWalletSelection(range, walletData.wallets.length);
-        } 
-        else if (selectionMethod6 === "3") {
-          // Pilih wallet secara manual
-          const manual = prompt("Masukkan nomor wallet dipisahkan koma (misal: 1,3,5,7): ");
-          selectedIndices6 = processWalletSelection(manual, walletData.wallets.length);
-        } 
-        else {
-          console.log("Pilihan tidak valid!");
-          break;
-        }
-        
-        if (selectedIndices6.length === 0) {
+        if (selectedIndices.length === 0) {
           console.log("Tidak ada wallet yang dipilih!");
           break;
         }
-        
-        // 3. Jumlah SOL per wallet
+
+        // 3. Masukkan jumlah SOL yang akan dikirim dari setiap wallet
         const amountPerWallet = parseFloat(prompt("Jumlah SOL yang akan dikirim dari setiap wallet: "));
-        
-        if (isNaN(amountPerWallet) || amountPerWallet <= 0) {
+        if (isNaN(amountPerWallet)) {
           console.log("Jumlah tidak valid!");
           break;
         }
-        
-        // Konfirmasi
-        console.log("\n===== KONFIRMASI TRANSFER BATCH =====");
-        console.log(`Wallet pengirim: ${selectedIndices6.length} wallet`);
-        console.log(`Wallet penerima: ${destinationAddress6}`);
+
+        // 4. Konfirmasi sebelum eksekusi
+        console.log("\n===== KONFIRMASI =====");
+        console.log(`Tujuan: ${destinationAddress}`);
+        console.log(`Jumlah wallet pengirim: ${selectedIndices.length}`);
         console.log(`Jumlah per wallet: ${amountPerWallet} SOL`);
-        console.log(`Total (estimasi): ${selectedIndices6.length * amountPerWallet} SOL`);
-        
-        const confirmBatch = prompt("Konfirmasi transfer batch? (y/n): ").toLowerCase();
-        
-        if (confirmBatch === 'y') {
-          // Eksekusi transfer batch
-          await sendFromMultipleWallets(
-            walletData.mnemonic,
-            selectedIndices6,
-            destinationAddress6,
-            amountPerWallet
-          );
-        } else {
-          console.log("Transfer batch dibatalkan.");
+        console.log(`Total yang akan dikirim: ${amountPerWallet * selectedIndices.length} SOL`);
+
+        const confirm = prompt("Lanjutkan? (y/n): ").toLowerCase();
+        if (confirm !== 'y') {
+          console.log("Transfer dibatalkan.");
+          break;
         }
+
+        // 5. Eksekusi transfer
+        console.log("\nMemulai transfer...");
+        await sendFromMultipleWallets(
+          walletData.mnemonic,
+          selectedIndices,
+          destinationAddress,
+          amountPerWallet
+        );
         break;
 
       case "7":
@@ -704,35 +884,34 @@ async function main() {
 
         console.log("\n===== KIRIM SELURUH SALDO DARI BANYAK WALLET KE 1 WALLET =====");
 
-        // Pilih wallet penerima
+        // 1. Pilih wallet penerima
         console.log("\n===== PILIH WALLET PENERIMA =====");
         console.log("Pilih opsi penerima:");
         console.log("1. Salah satu wallet sendiri");
         console.log("2. Alamat eksternal");
-        
-        const receiverOption7 = prompt("Pilih (1-2): ");
+
+        const receiverOption7 = prompt("Masukkan pilihan (1/2): ");
         let destinationAddress7;
-        
+
         if (receiverOption7 === "1") {
-          // Tampilkan daftar wallet
-          console.log("\nDaftar wallet Anda:");
+          // Pilih dari wallet sendiri
+          console.log("\n===== DAFTAR WALLET =====");
           walletData.wallets.forEach((wallet, i) => {
             console.log(`${i+1}. ${wallet.publicKey}`);
           });
-          
+
           const receiverIndex = parseInt(prompt("Pilih nomor wallet penerima: ")) - 1;
-          
-          if (isNaN(receiverIndex) || receiverIndex < 0 || receiverIndex >= walletData.wallets.length) {
-            console.log("Nomor wallet tidak valid!");
+          if (isNaN(receiverIndex)) {
+            console.log("Input tidak valid!");
             break;
           }
-          
+
           destinationAddress7 = walletData.wallets[receiverIndex].publicKey;
         } else if (receiverOption7 === "2") {
+          // Input alamat eksternal
           destinationAddress7 = prompt("Masukkan alamat penerima: ");
           try {
-            // Validasi alamat publik
-            new PublicKey(destinationAddress7);
+            new PublicKey(destinationAddress7); // Validasi alamat
           } catch (error) {
             console.log("Alamat Solana tidak valid!");
             break;
@@ -742,87 +921,154 @@ async function main() {
           break;
         }
 
-        // Pilih wallet pengirim (multiple)
+        // 2. Pilih wallet pengirim
         console.log("\n===== PILIH WALLET PENGIRIM =====");
-        
-        // Tampilkan daftar wallet dengan saldo
-        console.log("Mengambil info saldo untuk semua wallet...");
-        const walletBalances7 = [];
-        
-        for (let i = 0; i < walletData.wallets.length; i++) {
-          const wallet = walletData.wallets[i];
-          const balance = await getWalletBalance(wallet.publicKey);
-          walletBalances7.push({ index: i, balance });
-          console.log(`${i+1}. ${wallet.publicKey} - ${balance} SOL`);
-        }
-        
-        // Pilih cara memilih wallet
-        console.log("\nCara memilih wallet pengirim:");
-        console.log("1. Pilih semua wallet yang memiliki saldo");
-        console.log("2. Pilih wallet dengan range tertentu (misal: 1-10)");
-        console.log("3. Pilih wallet secara manual (misal: 1,3,5,7)");
-        
-        const selectionMethod7 = prompt("Pilih (1-3): ");
-        let sourceWalletIndices;
-        
-        if (selectionMethod7 === "1") {
-          // Pilih semua wallet yang memiliki saldo
-          sourceWalletIndices = walletBalances7
-            .filter(item => item.balance > 0)
-            .map(item => item.index);
-          
-          console.log(`${sourceWalletIndices.length} wallet dengan saldo dipilih.`);
-        } 
-        else if (selectionMethod7 === "2") {
-          // Pilih wallet dengan range dan format
-          const rangeInput = prompt("Masukkan range (misal: 1-10 atau 1,3,5-10): ");
-          sourceWalletIndices = processWalletSelection(rangeInput, walletData.wallets.length);
-        }
-        else if (selectionMethod7 === "3") {
-          // Pilih wallet secara manual
-          const manualInput = prompt("Masukkan nomor wallet dipisahkan koma (misal: 1,3,5,7): ");
-          sourceWalletIndices = processWalletSelection(manualInput, walletData.wallets.length);
-        }
-        else {
-          console.log("Pilihan tidak valid!");
-          break;
-        }
-        
-        if (sourceWalletIndices.length === 0) {
+        console.log("Format input:");
+        console.log("- Untuk memilih beberapa wallet: 1,3,5");
+        console.log("- Untuk memilih range wallet: 1-10");
+        console.log("- Bisa dikombinasikan: 1,3,5-10,15");
+        console.log("\nDaftar wallet tersedia:");
+        walletData.wallets.forEach((wallet, i) => {
+          console.log(`${i+1}. ${wallet.publicKey}`);
+        });
+
+        const walletSelection7 = prompt(`Masukkan nomor wallet pengirim (1-${walletData.wallets.length}): `);
+        const selectedIndices7 = processWalletSelection(walletSelection7, walletData.wallets.length);
+
+        if (selectedIndices7.length === 0) {
           console.log("Tidak ada wallet yang dipilih!");
           break;
         }
-        
-        // Konfirmasi
-        console.log("\n===== KONFIRMASI TRANSFER BATCH (SALDO PENUH) =====");
-        console.log(`Wallet pengirim: ${sourceWalletIndices.length} wallet`);
-        console.log(`Wallet penerima: ${destinationAddress7}`);
-        console.log(`Tindakan: Mengirim SELURUH SALDO dari setiap wallet`);
-        
-        const confirmMax = prompt("PERINGATAN: Ini akan mengirim SELURUH SALDO dari wallet yang dipilih. Lanjutkan? (y/n): ").toLowerCase();
-        
-        if (confirmMax === 'y') {
-          // Eksekusi transfer seluruh saldo
-          await sendMaxBalanceFromMultipleWallets(
-            walletData.mnemonic,
-            sourceWalletIndices,
-            destinationAddress7
-          );
-        } else {
-          console.log("Transfer batch dibatalkan.");
+
+        // 3. Konfirmasi sebelum eksekusi
+        console.log("\n===== KONFIRMASI =====");
+        console.log(`Tujuan: ${destinationAddress7}`);
+        console.log(`Jumlah wallet pengirim: ${selectedIndices7.length}`);
+        console.log("Akan mengirim seluruh saldo dari setiap wallet");
+
+        const confirm7 = prompt("Lanjutkan? (y/n): ").toLowerCase();
+        if (confirm7 !== 'y') {
+          console.log("Transfer dibatalkan.");
+          break;
         }
+
+        // 4. Eksekusi transfer
+        console.log("\nMemulai transfer...");
+        await sendMaxBalanceFromMultipleWallets(
+          walletData.mnemonic,
+          selectedIndices7,
+          destinationAddress7
+        );
         break;
 
       case "8":
-        console.log("Terima kasih telah menggunakan Solana Multi-Wallet Generator & Manager!");
+        // Kirim semua token dari banyak wallet ke 1 wallet
+        if (!walletData) {
+          console.log("Tidak ada wallet tersimpan. Buat wallet baru terlebih dahulu.");
+          break;
+        }
+
+        console.log("\n===== KIRIM SEMUA TOKEN DARI BANYAK WALLET KE 1 WALLET =====");
+
+        // 1. Masukkan alamat token (mint address)
+        const mintAddress = prompt("Masukkan alamat token (mint address) yang akan dikirim: ");
+        try {
+          new PublicKey(mintAddress); // Validasi alamat
+        } catch (error) {
+          console.log("Alamat token tidak valid!");
+          break;
+        }
+
+        // 2. Pilih wallet penerima
+        console.log("\n===== PILIH WALLET PENERIMA =====");
+        console.log("Pilih opsi penerima:");
+        console.log("1. Salah satu wallet sendiri");
+        console.log("2. Alamat eksternal");
+
+        const receiverOption8 = prompt("Masukkan pilihan (1/2): ");
+        let destinationAddress8;
+
+        if (receiverOption8 === "1") {
+          // Pilih dari wallet sendiri
+          console.log("\n===== DAFTAR WALLET =====");
+          walletData.wallets.forEach((wallet, i) => {
+            console.log(`${i+1}. ${wallet.publicKey}`);
+          });
+
+          const receiverIndex = parseInt(prompt("Pilih nomor wallet penerima: ")) - 1;
+          if (isNaN(receiverIndex)) {
+            console.log("Input tidak valid!");
+            break;
+          }
+
+          destinationAddress8 = walletData.wallets[receiverIndex].publicKey;
+        } else if (receiverOption8 === "2") {
+          // Input alamat eksternal
+          destinationAddress8 = prompt("Masukkan alamat penerima: ");
+          try {
+            new PublicKey(destinationAddress8); // Validasi alamat
+          } catch (error) {
+            console.log("Alamat Solana tidak valid!");
+            break;
+          }
+        } else {
+          console.log("Pilihan tidak valid!");
+          break;
+        }
+
+        // 3. Pilih wallet pengirim
+        console.log("\n===== PILIH WALLET PENGIRIM =====");
+        console.log("Format input:");
+        console.log("- Untuk memilih beberapa wallet: 1,3,5");
+        console.log("- Untuk memilih range wallet: 1-10");
+        console.log("- Bisa dikombinasikan: 1,3,5-10,15");
+        console.log("\nDaftar wallet tersedia:");
+        walletData.wallets.forEach((wallet, i) => {
+          console.log(`${i+1}. ${wallet.publicKey}`);
+        });
+
+        const walletSelection8 = prompt(`Masukkan nomor wallet pengirim (1-${walletData.wallets.length}): `);
+        const selectedIndices8 = processWalletSelection(walletSelection8, walletData.wallets.length);
+
+        if (selectedIndices8.length === 0) {
+          console.log("Tidak ada wallet yang dipilih!");
+          break;
+        }
+
+        // 4. Konfirmasi sebelum eksekusi
+        console.log("\n===== KONFIRMASI =====");
+        console.log(`Token: ${mintAddress}`);
+        console.log(`Tujuan: ${destinationAddress8}`);
+        console.log(`Jumlah wallet pengirim: ${selectedIndices8.length}`);
+        console.log("Akan mengirim semua token dari setiap wallet");
+
+        const confirm8 = prompt("Lanjutkan? (y/n): ").toLowerCase();
+        if (confirm8 !== 'y') {
+          console.log("Transfer dibatalkan.");
+          break;
+        }
+
+        // 5. Eksekusi transfer
+        console.log("\nMemulai transfer...");
+        await sendAllTokensFromMultipleWallets(
+          walletData.mnemonic,
+          selectedIndices8,
+          destinationAddress8,
+          mintAddress
+        );
+        break;
+
+      case "9":
+        // Keluar dari program
+        console.log("Keluar dari program...");
         running = false;
         break;
 
       default:
-        console.log("Pilihan tidak valid!");
+        console.log("Pilihan tidak valid! Silakan pilih 1-9.");
     }
   }
 }
 
 // Jalankan program
-main(); 
+main().catch(console.error);
